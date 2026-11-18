@@ -131,4 +131,92 @@
                 android:enabled="false"
                 android:minWidth="0dp"
                 android:paddingHorizontal="4dp"
-                android
+                android:text="Удалить"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Фон: "
+                android:textColor="#CCCCCC"
+                android:textSize="13sp" />
+
+            <Spinner
+                android:id="@+id/spinnerColor"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:backgroundTint="#FFFFFF" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnPickVideo"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="6dp"
+                android:layout_weight="1"
+                android:text="Видео" />
+
+            <Button
+                android:id="@+id/btnProcess"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Старт" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Панель просмотра результата -->
+    <LinearLayout
+        android:id="@+id/previewControlsLayout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <Button
+            android:id="@+id/btnBackToEdit"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1.2"
+            android:paddingHorizontal="4dp"
+            android:text="К правке"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnReplay"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:paddingHorizontal="4dp"
+            android:text="Повтор"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btnSaveGallery"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1.2"
+            android:paddingHorizontal="4dp"
+            android:text="Сохранить"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+</LinearLayout>
