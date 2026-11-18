@@ -19,29 +19,84 @@ import kotlin.math.roundToInt
 
 object VideoProcessor {
 
-    suspend fun loadFirstFrame(context: Context, videoUri: Uri): Bitmap? = withContext(Dispatchers.IO) {
+    data class VideoMetadata(
+        val durationMs: Long,
+        val fps: Int,
+        val firstFrame: Bitmap?
+    )
+
+    suspend fun getVideoMetadata(context: Context, videoUri: Uri): VideoMetadata = withContext(Dispatchers.IO) {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, videoUri)
-            retriever.getFrameAtIndex(0) ?: retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-        } catch (e: Exception) {
+            val durMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            val fpsStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            val fps = fpsStr?.toFloatOrNull()?.roundToInt() ?: 30
+            val first = retriever.getFrameAtIndex(0)
+                ?: retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+            VideoMetadata(durMs, fps.coerceIn(10, 60), first)
+        } catch (_: Exception) {
+            VideoMetadata(0L, 30, null)
+        } finally {
+            retriever.release()
+        }
+    }
+
+    suspend fun loadFrameAtTime(
+        context: Context,
+        videoUri: Uri,
+        timeMs: Long,
+        exact: Boolean
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(context, videoUri)
+            val option = if (exact) {
+                MediaMetadataRetriever.OPTION_CLOSEST
+            } else {
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+            }
+            retriever.getFrameAtTime(timeMs * 1000L, option)
+        } catch (_: Exception) {
             null
         } finally {
             retriever.release()
         }
     }
 
-    suspend fun processVideo(
+    suspend fun processVideoSegment(
         context: Context,
         videoUri: Uri,
         contourPoints: List<PointF>,
         chromaColor: Int,
+        startMs: Long,
+        endMs: Long,
         onProgress: (current: Int, total: Int) -> Unit
-    ): Uri = withContext(Dispatchers.IO) {
+    ): File = withContext(Dispatchers.IO) {
 
         val videoInfo = readVideoInfo(context, videoUri)
-        val firstBmp = loadFirstFrame(context, videoUri)
-            ?: throw IllegalStateException("Не удалось прочитать первый кадр видео")
+        val startUs = startMs * 1000L
+        val endUs = endMs * 1000L
+
+        val startIdx = videoInfo.timestampsUs.indexOfFirst { it >= startUs }.let {
+            if (it >= 0) it else 0
+        }
+        val endIdx = videoInfo.timestampsUs.indexOfLast { it <= endUs }.let {
+            if (it >= startIdx) it else videoInfo.timestampsUs.lastIndex
+        }
+
+        val segmentTimestamps = if (videoInfo.timestampsUs.isNotEmpty() && startIdx <= endIdx) {
+            videoInfo.timestampsUs.subList(startIdx, endIdx + 1)
+        } else {
+            emptyList()
+        }
+
+        if (segmentTimestamps.isEmpty()) {
+            throw IllegalStateException("В выбранном отрезке нет кадров")
+        }
+
+        val firstBmp = loadFrameAtTime(context, videoUri, startMs, exact = true)
+            ?: throw IllegalStateException("Не удалось прочитать начальный кадр")
 
         val scaleOut = if (maxOf(firstBmp.width, firstBmp.height) > 1280) {
             1280.0 / maxOf(firstBmp.width, firstBmp.height)
@@ -50,8 +105,8 @@ object VideoProcessor {
         val outH = ((firstBmp.height * scaleOut).roundToInt() / 2) * 2
         firstBmp.recycle()
 
-        val tempFile = File(context.cacheDir, "rotokey_temp_${System.currentTimeMillis()}.mp4")
-        if (tempFile.exists()) tempFile.delete()
+        val previewFile = File(context.cacheDir, "rotokey_preview_${System.currentTimeMillis()}.mp4")
+        if (previewFile.exists()) previewFile.delete()
 
         val tracker = OpenCVTracker(chromaColor)
         val retriever = MediaMetadataRetriever()
@@ -72,7 +127,7 @@ object VideoProcessor {
         val inputSurface = encoder.createInputSurface()
         encoder.start()
 
-        val muxer = MediaMuxer(tempFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        val muxer = MediaMuxer(previewFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var trackIndex = -1
         var muxerStarted = false
         var encodedFrames = 0L
@@ -117,16 +172,17 @@ object VideoProcessor {
         }
 
         try {
-            val totalFrames = videoInfo.timestampsUs.size.coerceAtLeast(1)
+            val totalSegmentFrames = segmentTimestamps.size
             var frameCounter = 0
 
-            val useBatch = videoInfo.reportedFrameCount > 0
-            if (useBatch) {
+            val canUseBatch = videoInfo.reportedFrameCount > 0 &&
+                videoInfo.reportedFrameCount == videoInfo.timestampsUs.size
+
+            if (canUseBatch) {
                 val batchSize = 4
-                var idx = 0
-                val total = videoInfo.reportedFrameCount
-                while (idx < total) {
-                    val count = min(batchSize, total - idx)
+                var idx = startIdx
+                while (idx <= endIdx) {
+                    val count = min(batchSize, endIdx - idx + 1)
                     val frames = try {
                         retriever.getFramesAtIndex(idx, count)
                     } catch (_: Exception) {
@@ -147,16 +203,17 @@ object VideoProcessor {
                         drainEncoder(false)
 
                         frameCounter++
-                        onProgress(frameCounter, total)
+                        onProgress(frameCounter, totalSegmentFrames)
                     }
                     idx += frames.size
                 }
             }
 
+            // Резервный или точный проход по таймстемпам выбранного отрезка
             if (frameCounter == 0) {
-                for (i in videoInfo.timestampsUs.indices) {
+                for (tsUs in segmentTimestamps) {
                     val rawBmp = retriever.getFrameAtTime(
-                        videoInfo.timestampsUs[i],
+                        tsUs,
                         MediaMetadataRetriever.OPTION_CLOSEST
                     ) ?: continue
 
@@ -172,7 +229,7 @@ object VideoProcessor {
                     drainEncoder(false)
 
                     frameCounter++
-                    onProgress(frameCounter, totalFrames)
+                    onProgress(frameCounter, totalSegmentFrames)
                 }
             }
 
@@ -189,9 +246,31 @@ object VideoProcessor {
             muxer.release()
         }
 
-        val savedUri = saveToGallery(context, tempFile)
-        tempFile.delete()
-        savedUri
+        previewFile
+    }
+
+    suspend fun saveToGallery(context: Context, file: File): Uri = withContext(Dispatchers.IO) {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "RotoKey_${System.currentTimeMillis()}.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/RotoKey")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Не удалось создать запись в MediaStore")
+
+        resolver.openOutputStream(uri)?.use { out ->
+            FileInputStream(file).use { input ->
+                input.copyTo(out)
+            }
+        }
+
+        values.clear()
+        values.put(MediaStore.Video.Media.IS_PENDING, 0)
+        resolver.update(uri, values, null, null)
+        uri
     }
 
     private data class VideoInfo(
@@ -238,29 +317,5 @@ object VideoProcessor {
 
         timestamps.sort()
         return VideoInfo(fps, reportedCount, timestamps)
-    }
-
-    private fun saveToGallery(context: Context, file: File): Uri {
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, "RotoKey_${System.currentTimeMillis()}.mp4")
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/RotoKey")
-            put(MediaStore.Video.Media.IS_PENDING, 1)
-        }
-
-        val resolver = context.contentResolver
-        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-            ?: throw IllegalStateException("Не удалось создать запись в MediaStore")
-
-        resolver.openOutputStream(uri)?.use { out ->
-            FileInputStream(file).use { input ->
-                input.copyTo(out)
-            }
-        }
-
-        values.clear()
-        values.put(MediaStore.Video.Media.IS_PENDING, 0)
-        resolver.update(uri, values, null, null)
-        return uri
     }
 }
