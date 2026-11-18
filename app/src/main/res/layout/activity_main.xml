@@ -10,76 +10,125 @@
         android:id="@+id/tvStatus"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:paddingBottom="8dp"
+        android:paddingBottom="6dp"
         android:text="1. Выберите видео и обведите объект пальцем"
         android:textColor="#FFFFFF"
         android:textSize="14sp" />
 
-    <com.rotokey.app.ContourOverlayView
-        android:id="@+id/contourView"
+    <FrameLayout
+        android:id="@+id/previewContainer"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:background="#1E1E1E" />
+        android:background="#1E1E1E">
+
+        <com.rotokey.app.ContourOverlayView
+            android:id="@+id/contourView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <VideoView
+            android:id="@+id/videoPreview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:visibility="gone" />
+    </FrameLayout>
 
     <ProgressBar
         android:id="@+id/progressBar"
         style="?android:attr/progressBarStyleHorizontal"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="6dp"
         android:visibility="gone" />
 
+    <!-- Панель редактирования -->
     <LinearLayout
+        android:id="@+id/editControlsLayout"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
+        android:layout_marginTop="6dp"
+        android:orientation="vertical">
 
-        <TextView
-            android:layout_width="wrap_content"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Фон: "
-            android:textColor="#CCCCCC"
-            android:textSize="14sp" />
+            android:orientation="horizontal">
 
-        <Spinner
-            android:id="@+id/spinnerColor"
-            android:layout_width="0dp"
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Отрезок: "
+                android:textColor="#CCCCCC"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/tvTimeRange"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="00:00.0 — 00:00.0"
+                android:textColor="#FFFFFF"
+                android:textSize="13sp" />
+        </LinearLayout>
+
+        <com.google.android.material.slider.RangeSlider
+            android:id="@+id/rangeSlider"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:backgroundTint="#FFFFFF" />
-    </LinearLayout>
+            android:enabled="false"
+            android:valueFrom="0.0"
+            android:valueTo="1.0" />
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:orientation="horizontal">
-
-        <Button
-            android:id="@+id/btnPickVideo"
-            android:layout_width="0dp"
+        <!-- Кнопки управления контуром -->
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginEnd="6dp"
-            android:layout_weight="1"
-            android:text="Видео" />
+            android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/btnClear"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginEnd="6dp"
-            android:layout_weight="1"
-            android:text="Сброс" />
+            <Button
+                android:id="@+id/btnUndo"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="4dp"
+                android:text="↶"
+                android:textSize="18sp" />
 
-        <Button
-            android:id="@+id/btnProcess"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Старт" />
-    </LinearLayout>
+            <Button
+                android:id="@+id/btnRedo"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="4dp"
+                android:text="↷"
+                android:textSize="18sp" />
 
-</LinearLayout>
+            <Button
+                android:id="@+id/btnDeletePoint"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1.3"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="4dp"
+                android:text="- Точка"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnDeleteContour"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1.3"
+                android:enabled="false"
+                android:minWidth="0dp"
+                android:paddingHorizontal="4dp"
+                android
