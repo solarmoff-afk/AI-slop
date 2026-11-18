@@ -3,6 +3,7 @@ package com.rotokey.app
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.ImageDecoder
 import android.graphics.PointF
 import android.graphics.Rect
 import android.media.*
@@ -14,6 +15,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
+import java.nio.ByteBuffer
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -64,6 +67,20 @@ object VideoProcessor {
         }
     }
 
+    suspend fun loadPhotoBitmap(context: Context, photoUri: Uri): Bitmap = withContext(Dispatchers.IO) {
+        val source = ImageDecoder.createSource(context.contentResolver, photoUri)
+        ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            val w = info.size.width
+            val h = info.size.height
+            val maxS = max(w, h)
+            if (maxS > 1280) {
+                val scale = 1280.0 / maxS
+                decoder.setTargetSize(max(2, (w * scale).roundToInt()), max(2, (h * scale).roundToInt()))
+            }
+        }
+    }
+
     suspend fun processVideoSegment(
         context: Context,
         videoUri: Uri,
@@ -75,101 +92,38 @@ object VideoProcessor {
     ): File = withContext(Dispatchers.IO) {
 
         val videoInfo = readVideoInfo(context, videoUri)
-        val startUs = startMs * 1000L
-        val endUs = endMs * 1000L
-
-        val startIdx = videoInfo.timestampsUs.indexOfFirst { it >= startUs }.let {
-            if (it >= 0) it else 0
-        }
-        val endIdx = videoInfo.timestampsUs.indexOfLast { it <= endUs }.let {
-            if (it >= startIdx) it else videoInfo.timestampsUs.lastIndex
-        }
-
-        val segmentTimestamps = if (videoInfo.timestampsUs.isNotEmpty() && startIdx <= endIdx) {
-            videoInfo.timestampsUs.subList(startIdx, endIdx + 1)
-        } else {
-            emptyList()
-        }
-
+        val segmentRange = getSegmentIndices(videoInfo.timestampsUs, startMs, endMs)
+        val segmentTimestamps = segmentRange.timestamps
         if (segmentTimestamps.isEmpty()) {
             throw IllegalStateException("В выбранном отрезке нет кадров")
         }
 
+        val audioStartUs = segmentTimestamps.first()
+        val audioEndUs = segmentTimestamps.last() + (1_000_000L / videoInfo.fps.coerceIn(10, 60))
+
         val firstBmp = loadFrameAtTime(context, videoUri, startMs, exact = true)
             ?: throw IllegalStateException("Не удалось прочитать начальный кадр")
 
-        val scaleOut = if (maxOf(firstBmp.width, firstBmp.height) > 1280) {
-            1280.0 / maxOf(firstBmp.width, firstBmp.height)
-        } else 1.0
-        val outW = ((firstBmp.width * scaleOut).roundToInt() / 2) * 2
-        val outH = ((firstBmp.height * scaleOut).roundToInt() / 2) * 2
+        val (outW, outH) = computeEvenSize(firstBmp.width, firstBmp.height)
         firstBmp.recycle()
-
-        val previewFile = File(context.cacheDir, "rotokey_preview_${System.currentTimeMillis()}.mp4")
-        if (previewFile.exists()) previewFile.delete()
 
         val tracker = OpenCVTracker(chromaColor)
         val retriever = MediaMetadataRetriever()
         retriever.setDataSource(context, videoUri)
 
-        val fps = videoInfo.fps.coerceIn(10, 60)
-        val frameDurationUs = 1_000_000L / fps
+        val previewFile = File(context.cacheDir, "rotokey_preview_${System.currentTimeMillis()}.mp4")
+        if (previewFile.exists()) previewFile.delete()
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, outW * outH * 4)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        }
-
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val inputSurface = encoder.createInputSurface()
-        encoder.start()
-
-        val muxer = MediaMuxer(previewFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var trackIndex = -1
-        var muxerStarted = false
-        var encodedFrames = 0L
-
-        fun drainEncoder(endOfStream: Boolean) {
-            if (endOfStream) encoder.signalEndOfInputStream()
-            val bufferInfo = MediaCodec.BufferInfo()
-            while (true) {
-                val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000)
-                if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    if (!endOfStream) break
-                } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    if (!muxerStarted) {
-                        trackIndex = muxer.addTrack(encoder.outputFormat)
-                        muxer.start()
-                        muxerStarted = true
-                    }
-                } else if (outIndex >= 0) {
-                    val encodedData = encoder.getOutputBuffer(outIndex)
-                    if (encodedData != null && bufferInfo.size > 0 &&
-                        (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && muxerStarted
-                    ) {
-                        encodedData.position(bufferInfo.offset)
-                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                        bufferInfo.presentationTimeUs = encodedFrames * frameDurationUs
-                        muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
-                        encodedFrames++
-                    }
-                    encoder.releaseOutputBuffer(outIndex, false)
-                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
-                }
-            }
-        }
-
-        fun drawBitmapToSurface(surface: Surface, bmp: Bitmap) {
-            val canvas = surface.lockCanvas(null)
-            try {
-                canvas.drawBitmap(bmp, null, Rect(0, 0, outW, outH), null)
-            } finally {
-                surface.unlockCanvasAndPost(canvas)
-            }
-        }
+        val session = MuxedVideoSession(
+            context = context,
+            outputFile = previewFile,
+            outW = outW,
+            outH = outH,
+            fps = videoInfo.fps.coerceIn(10, 60),
+            audioSourceUri = videoUri,
+            audioStartUs = audioStartUs,
+            audioEndUs = audioEndUs
+        )
 
         try {
             val totalSegmentFrames = segmentTimestamps.size
@@ -180,9 +134,9 @@ object VideoProcessor {
 
             if (canUseBatch) {
                 val batchSize = 4
-                var idx = startIdx
-                while (idx <= endIdx) {
-                    val count = min(batchSize, endIdx - idx + 1)
+                var idx = segmentRange.startIdx
+                while (idx <= segmentRange.endIdx) {
+                    val count = min(batchSize, segmentRange.endIdx - idx + 1)
                     val frames = try {
                         retriever.getFramesAtIndex(idx, count)
                     } catch (_: Exception) {
@@ -198,9 +152,8 @@ object VideoProcessor {
                         }
                         rawBmp.recycle()
 
-                        drawBitmapToSurface(inputSurface, processed)
+                        session.writeFrame(processed)
                         processed.recycle()
-                        drainEncoder(false)
 
                         frameCounter++
                         onProgress(frameCounter, totalSegmentFrames)
@@ -209,13 +162,10 @@ object VideoProcessor {
                 }
             }
 
-            // Резервный или точный проход по таймстемпам выбранного отрезка
             if (frameCounter == 0) {
                 for (tsUs in segmentTimestamps) {
-                    val rawBmp = retriever.getFrameAtTime(
-                        tsUs,
-                        MediaMetadataRetriever.OPTION_CLOSEST
-                    ) ?: continue
+                    val rawBmp = retriever.getFrameAtTime(tsUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        ?: continue
 
                     val processed = if (frameCounter == 0) {
                         tracker.initFirstFrame(rawBmp, contourPoints)
@@ -224,26 +174,256 @@ object VideoProcessor {
                     }
                     rawBmp.recycle()
 
-                    drawBitmapToSurface(inputSurface, processed)
+                    session.writeFrame(processed)
                     processed.recycle()
-                    drainEncoder(false)
 
                     frameCounter++
                     onProgress(frameCounter, totalSegmentFrames)
                 }
             }
 
-            drainEncoder(true)
+            session.finish()
         } finally {
             tracker.release()
             retriever.release()
-            inputSurface.release()
-            try { encoder.stop() } catch (_: Exception) {}
-            encoder.release()
-            if (muxerStarted) {
-                try { muxer.stop() } catch (_: Exception) {}
+            session.release()
+        }
+
+        previewFile
+    }
+
+    suspend fun processShakeTransfer(
+        context: Context,
+        donorVideoUri: Uri,
+        donorStartMs: Long,
+        donorEndMs: Long,
+        targetPhotoUri: Uri?,
+        targetVideoUri: Uri?,
+        strength: Float,
+        zoomScale: Float,
+        onProgress: (phase: String, current: Int, total: Int) -> Unit
+    ): File = withContext(Dispatchers.IO) {
+
+        if (targetPhotoUri == null && targetVideoUri == null) {
+            throw IllegalStateException("Выберите фото или видео, на которое перенести качку")
+        }
+
+        // Фаза 1: Считываем траекторию камеры с видео-донора
+        val donorInfo = readVideoInfo(context, donorVideoUri)
+        val donorRange = getSegmentIndices(donorInfo.timestampsUs, donorStartMs, donorEndMs)
+        if (donorRange.timestamps.isEmpty()) {
+            throw IllegalStateException("В отрезке донора нет кадров")
+        }
+
+        val deltas = ArrayList<OpenCVShakeTransfer.MotionDelta>(donorRange.timestamps.size)
+        val shakeAnalyzer = OpenCVShakeTransfer()
+        val donorRetriever = MediaMetadataRetriever()
+        donorRetriever.setDataSource(context, donorVideoUri)
+
+        try {
+            val totalDonor = donorRange.timestamps.size
+            var donorCount = 0
+            val canBatchDonor = donorInfo.reportedFrameCount > 0 &&
+                donorInfo.reportedFrameCount == donorInfo.timestampsUs.size
+
+            if (canBatchDonor) {
+                var idx = donorRange.startIdx
+                while (idx <= donorRange.endIdx) {
+                    val count = min(4, donorRange.endIdx - idx + 1)
+                    val frames = try {
+                        donorRetriever.getFramesAtIndex(idx, count)
+                    } catch (_: Exception) {
+                        emptyList()
+                    }
+                    if (frames.isEmpty()) break
+
+                    for (bmp in frames) {
+                        if (donorCount == 0) {
+                            shakeAnalyzer.initDonorFrame(bmp)
+                            deltas.add(OpenCVShakeTransfer.MotionDelta(0.0, 0.0, 0.0))
+                        } else {
+                            deltas.add(shakeAnalyzer.stepDonorFrame(bmp))
+                        }
+                        bmp.recycle()
+                        donorCount++
+                        onProgress("Анализ донора", donorCount, totalDonor)
+                    }
+                    idx += frames.size
+                }
             }
-            muxer.release()
+
+            if (donorCount == 0) {
+                for (tsUs in donorRange.timestamps) {
+                    val bmp = donorRetriever.getFrameAtTime(tsUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        ?: continue
+                    if (donorCount == 0) {
+                        shakeAnalyzer.initDonorFrame(bmp)
+                        deltas.add(OpenCVShakeTransfer.MotionDelta(0.0, 0.0, 0.0))
+                    } else {
+                        deltas.add(shakeAnalyzer.stepDonorFrame(bmp))
+                    }
+                    bmp.recycle()
+                    donorCount++
+                    onProgress("Анализ донора", donorCount, totalDonor)
+                }
+            }
+        } finally {
+            shakeAnalyzer.release()
+            donorRetriever.release()
+        }
+
+        if (deltas.isEmpty()) {
+            throw IllegalStateException("Не удалось извлечь движение с видео-донора")
+        }
+
+        val previewFile = File(context.cacheDir, "rotokey_shake_${System.currentTimeMillis()}.mp4")
+        if (previewFile.exists()) previewFile.delete()
+
+        // Фаза 2: Применяем качку на Фото или на Видео
+        if (targetPhotoUri != null) {
+            val photoBmp = loadPhotoBitmap(context, targetPhotoUri)
+            val (outW, outH) = computeEvenSize(photoBmp.width, photoBmp.height)
+            val srcBgr = OpenCVShakeTransfer.bitmapToBgrMat(photoBmp)
+            photoBmp.recycle()
+
+            val fps = donorInfo.fps.coerceIn(10, 60)
+            val session = MuxedVideoSession(
+                context = context,
+                outputFile = previewFile,
+                outW = outW,
+                outH = outH,
+                fps = fps,
+                audioSourceUri = null,
+                audioStartUs = 0L,
+                audioEndUs = 0L
+            )
+
+            var cumX = 0.0
+            var cumY = 0.0
+            var cumAngle = 0.0
+
+            try {
+                for (i in deltas.indices) {
+                    val d = deltas[i]
+                    cumX = cumX * 0.96 + d.dxNorm * outW * strength
+                    cumY = cumY * 0.96 + d.dyNorm * outH * strength
+                    cumAngle = cumAngle * 0.96 + d.dAngleDeg * strength
+
+                    val warpedBmp = OpenCVShakeTransfer.renderWarpedFrame(
+                        srcBgr = srcBgr,
+                        outW = outW,
+                        outH = outH,
+                        offsetX = cumX,
+                        offsetY = cumY,
+                        angleDeg = cumAngle,
+                        zoomScale = zoomScale.toDouble()
+                    )
+                    session.writeFrame(warpedBmp)
+                    warpedBmp.recycle()
+                    onProgress("Рендер фото", i + 1, deltas.size)
+                }
+                session.finish()
+            } finally {
+                srcBgr.release()
+                session.release()
+            }
+        } else if (targetVideoUri != null) {
+            val targetInfo = readVideoInfo(context, targetVideoUri)
+            if (targetInfo.timestampsUs.isEmpty()) {
+                throw IllegalStateException("В целевом видео нет кадров")
+            }
+
+            val firstTargetBmp = loadFrameAtTime(context, targetVideoUri, 0L, exact = true)
+                ?: throw IllegalStateException("Не удалось прочитать целевое видео")
+            val (outW, outH) = computeEvenSize(firstTargetBmp.width, firstTargetBmp.height)
+            firstTargetBmp.recycle()
+
+            val fps = targetInfo.fps.coerceIn(10, 60)
+            val audioStartUs = targetInfo.timestampsUs.first()
+            val audioEndUs = targetInfo.timestampsUs.last() + (1_000_000L / fps)
+
+            val session = MuxedVideoSession(
+                context = context,
+                outputFile = previewFile,
+                outW = outW,
+                outH = outH,
+                fps = fps,
+                audioSourceUri = targetVideoUri,
+                audioStartUs = audioStartUs,
+                audioEndUs = audioEndUs
+            )
+
+            val targetRetriever = MediaMetadataRetriever()
+            targetRetriever.setDataSource(context, targetVideoUri)
+
+            var cumX = 0.0
+            var cumY = 0.0
+            var cumAngle = 0.0
+
+            fun processTargetBitmap(rawBmp: Bitmap, frameIdx: Int) {
+                val d = deltas[frameIdx % deltas.size]
+                cumX = cumX * 0.96 + d.dxNorm * outW * strength
+                cumY = cumY * 0.96 + d.dyNorm * outH * strength
+                cumAngle = cumAngle * 0.96 + d.dAngleDeg * strength
+
+                val srcBgr = OpenCVShakeTransfer.bitmapToBgrMat(rawBmp)
+                val warpedBmp = OpenCVShakeTransfer.renderWarpedFrame(
+                    srcBgr = srcBgr,
+                    outW = outW,
+                    outH = outH,
+                    offsetX = cumX,
+                    offsetY = cumY,
+                    angleDeg = cumAngle,
+                    zoomScale = zoomScale.toDouble()
+                )
+                srcBgr.release()
+                session.writeFrame(warpedBmp)
+                warpedBmp.recycle()
+            }
+
+            try {
+                val totalTarget = targetInfo.timestampsUs.size
+                var frameCounter = 0
+                val canBatchTarget = targetInfo.reportedFrameCount > 0 &&
+                    targetInfo.reportedFrameCount == targetInfo.timestampsUs.size
+
+                if (canBatchTarget) {
+                    var idx = 0
+                    while (idx < targetInfo.reportedFrameCount) {
+                        val count = min(4, targetInfo.reportedFrameCount - idx)
+                        val frames = try {
+                            targetRetriever.getFramesAtIndex(idx, count)
+                        } catch (_: Exception) {
+                            emptyList()
+                        }
+                        if (frames.isEmpty()) break
+
+                        for (rawBmp in frames) {
+                            processTargetBitmap(rawBmp, frameCounter)
+                            rawBmp.recycle()
+                            frameCounter++
+                            onProgress("Рендер видео", frameCounter, totalTarget)
+                        }
+                        idx += frames.size
+                    }
+                }
+
+                if (frameCounter == 0) {
+                    for (tsUs in targetInfo.timestampsUs) {
+                        val rawBmp = targetRetriever.getFrameAtTime(tsUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                            ?: continue
+                        processTargetBitmap(rawBmp, frameCounter)
+                        rawBmp.recycle()
+                        frameCounter++
+                        onProgress("Рендер видео", frameCounter, totalTarget)
+                    }
+                }
+
+                session.finish()
+            } finally {
+                targetRetriever.release()
+                session.release()
+            }
         }
 
         previewFile
@@ -271,6 +451,195 @@ object VideoProcessor {
         values.put(MediaStore.Video.Media.IS_PENDING, 0)
         resolver.update(uri, values, null, null)
         uri
+    }
+
+    private class MuxedVideoSession(
+        context: Context,
+        outputFile: File,
+        private val outW: Int,
+        private val outH: Int,
+        fps: Int,
+        audioSourceUri: Uri?,
+        private val audioStartUs: Long,
+        private val audioEndUs: Long
+    ) {
+        private val frameDurationUs = 1_000_000L / fps
+        private val encoder: MediaCodec
+        private val inputSurface: Surface
+        private val muxer: MediaMuxer
+
+        private var videoTrackIndex = -1
+        private var audioTrackIndex = -1
+        private var muxerStarted = false
+        private var encodedFrames = 0L
+
+        private var audioExtractor: MediaExtractor? = null
+        private var audioFormat: MediaFormat? = null
+        private var sourceAudioTrack = -1
+
+        init {
+            if (audioSourceUri != null) {
+                val ext = MediaExtractor()
+                try {
+                    ext.setDataSource(context, audioSourceUri, null)
+                    for (i in 0 until ext.trackCount) {
+                        val fmt = ext.getTrackFormat(i)
+                        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
+                        if (mime.startsWith("audio/")) {
+                            sourceAudioTrack = i
+                            audioFormat = fmt
+                            ext.selectTrack(i)
+                            audioExtractor = ext
+                            break
+                        }
+                    }
+                    if (audioExtractor == null) ext.release()
+                } catch (_: Exception) {
+                    ext.release()
+                }
+            }
+
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, outW * outH * 4)
+                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            }
+
+            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            inputSurface = encoder.createInputSurface()
+            encoder.start()
+
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        }
+
+        fun writeFrame(bmp: Bitmap) {
+            val canvas = inputSurface.lockCanvas(null)
+            try {
+                canvas.drawBitmap(bmp, null, Rect(0, 0, outW, outH), null)
+            } finally {
+                inputSurface.unlockCanvasAndPost(canvas)
+            }
+            drainEncoder(false)
+        }
+
+        fun finish() {
+            drainEncoder(true)
+            copyAudioSamples()
+        }
+
+        private fun drainEncoder(endOfStream: Boolean) {
+            if (endOfStream) encoder.signalEndOfInputStream()
+            val bufferInfo = MediaCodec.BufferInfo()
+            while (true) {
+                val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000)
+                if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    if (!endOfStream) break
+                } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (!muxerStarted) {
+                        videoTrackIndex = muxer.addTrack(encoder.outputFormat)
+                        audioFormat?.let { fmt ->
+                            try {
+                                audioTrackIndex = muxer.addTrack(fmt)
+                            } catch (_: Exception) {
+                                audioTrackIndex = -1
+                            }
+                        }
+                        muxer.start()
+                        muxerStarted = true
+                    }
+                } else if (outIndex >= 0) {
+                    val encodedData = encoder.getOutputBuffer(outIndex)
+                    if (encodedData != null && bufferInfo.size > 0 &&
+                        (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && muxerStarted
+                    ) {
+                        encodedData.position(bufferInfo.offset)
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                        bufferInfo.presentationTimeUs = encodedFrames * frameDurationUs
+                        muxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                        encodedFrames++
+                    }
+                    encoder.releaseOutputBuffer(outIndex, false)
+                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break
+                }
+            }
+        }
+
+        private fun copyAudioSamples() {
+            val ext = audioExtractor ?: return
+            if (audioTrackIndex < 0 || !muxerStarted) return
+
+            val maxInputSize = audioFormat?.let {
+                if (it.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) it.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE) else 256 * 1024
+            } ?: (256 * 1024)
+
+            val buffer = ByteBuffer.allocate(max(256 * 1024, maxInputSize))
+            val info = MediaCodec.BufferInfo()
+
+            ext.seekTo(audioStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            var lastPts = -1L
+
+            while (true) {
+                val sampleSize = ext.readSampleData(buffer, 0)
+                if (sampleSize < 0) break
+                val sampleTime = ext.sampleTime
+                if (sampleTime > audioEndUs) break
+
+                if (sampleTime >= audioStartUs) {
+                    val pts = sampleTime - audioStartUs
+                    if (pts > lastPts) {
+                        buffer.position(0)
+                        buffer.limit(sampleSize)
+                        info.offset = 0
+                        info.size = sampleSize
+                        info.presentationTimeUs = pts
+                        info.flags = if ((ext.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                            MediaCodec.BUFFER_FLAG_KEY_FRAME
+                        } else {
+                            0
+                        }
+                        muxer.writeSampleData(audioTrackIndex, buffer, info)
+                        lastPts = pts
+                    }
+                }
+                ext.advance()
+            }
+        }
+
+        fun release() {
+            try { audioExtractor?.release() } catch (_: Exception) {}
+            try { inputSurface.release() } catch (_: Exception) {}
+            try { encoder.stop() } catch (_: Exception) {}
+            try { encoder.release() } catch (_: Exception) {}
+            if (muxerStarted) {
+                try { muxer.stop() } catch (_: Exception) {}
+            }
+            try { muxer.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun computeEvenSize(srcW: Int, srcH: Int): Pair<Int, Int> {
+        val scaleOut = if (max(srcW, srcH) > 1280) 1280.0 / max(srcW, srcH) else 1.0
+        val outW = max(2, ((srcW * scaleOut).roundToInt() / 2) * 2)
+        val outH = max(2, ((srcH * scaleOut).roundToInt() / 2) * 2)
+        return outW to outH
+    }
+
+    private data class SegmentRange(
+        val startIdx: Int,
+        val endIdx: Int,
+        val timestamps: List<Long>
+    )
+
+    private fun getSegmentIndices(timestampsUs: List<Long>, startMs: Long, endMs: Long): SegmentRange {
+        if (timestampsUs.isEmpty()) return SegmentRange(0, -1, emptyList())
+        val startUs = startMs * 1000L
+        val endUs = endMs * 1000L
+        val startIdx = timestampsUs.indexOfFirst { it >= startUs }.let { if (it >= 0) it else 0 }
+        val endIdx = timestampsUs.indexOfLast { it <= endUs }.let { if (it >= startIdx) it else timestampsUs.lastIndex }
+        val list = if (startIdx <= endIdx) timestampsUs.subList(startIdx, endIdx + 1) else emptyList()
+        return SegmentRange(startIdx, endIdx, list)
     }
 
     private data class VideoInfo(

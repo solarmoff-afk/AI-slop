@@ -4,16 +4,40 @@
     android:layout_height="match_parent"
     android:background="#121212"
     android:orientation="vertical"
-    android:padding="12dp">
+    android:padding="10dp">
+
+    <!-- Переключатель режимов -->
+    <LinearLayout
+        android:id="@+id/modeSwitchLayout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingBottom="4dp">
+        <Button
+            android:id="@+id/btnModeRoto"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_marginEnd="6dp"
+            android:layout_weight="1"
+            android:text="Ротоскоп"
+            android:textSize="12sp" />
+        <Button
+            android:id="@+id/btnModeShake"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:text="Перенос качки"
+            android:textSize="12sp" />
+    </LinearLayout>
 
     <TextView
         android:id="@+id/tvStatus"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:paddingBottom="6dp"
-        android:text="1. Выберите видео и обведите объект пальцем"
+        android:paddingBottom="4dp"
+        android:text="Выберите видео и обведите объект пальцем"
         android:textColor="#FFFFFF"
-        android:textSize="14sp" />
+        android:textSize="13sp" />
 
     <FrameLayout
         android:id="@+id/previewContainer"
@@ -26,6 +50,13 @@
             android:id="@+id/contourView"
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
+
+        <ImageView
+            android:id="@+id/targetImageView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter"
+            android:visibility="gone" />
 
         <VideoView
             android:id="@+id/videoPreview"
@@ -40,29 +71,28 @@
         style="?android:attr/progressBarStyleHorizontal"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
+        android:layout_marginTop="4dp"
         android:visibility="gone" />
 
-    <!-- Панель редактирования -->
+    <!-- Общий таймлайн -->
     <LinearLayout
-        android:id="@+id/editControlsLayout"
+        android:id="@+id/timelineLayout"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
+        android:layout_marginTop="4dp"
         android:orientation="vertical">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal">
-
             <TextView
+                android:id="@+id/tvTimelineLabel"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Отрезок: "
                 android:textColor="#CCCCCC"
-                android:textSize="13sp" />
-
+                android:textSize="12sp" />
             <TextView
                 android:id="@+id/tvTimeRange"
                 android:layout_width="0dp"
@@ -70,7 +100,7 @@
                 android:layout_weight="1"
                 android:text="00:00.0 — 00:00.0"
                 android:textColor="#FFFFFF"
-                android:textSize="13sp" />
+                android:textSize="12sp" />
         </LinearLayout>
 
         <com.google.android.material.slider.RangeSlider
@@ -80,59 +110,62 @@
             android:enabled="false"
             android:valueFrom="0.0"
             android:valueTo="1.0" />
+    </LinearLayout>
 
-        <!-- Кнопки управления контуром -->
+    <!-- Панель режима Ротоскоп -->
+    <LinearLayout
+        android:id="@+id/rotoControlsLayout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal">
-
             <Button
                 android:id="@+id/btnUndo"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="40dp"
                 android:layout_marginEnd="4dp"
                 android:layout_weight="1"
                 android:enabled="false"
                 android:minWidth="0dp"
                 android:paddingHorizontal="4dp"
                 android:text="↶"
-                android:textSize="18sp" />
-
+                android:textSize="16sp" />
             <Button
                 android:id="@+id/btnRedo"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="40dp"
                 android:layout_marginEnd="4dp"
                 android:layout_weight="1"
                 android:enabled="false"
                 android:minWidth="0dp"
                 android:paddingHorizontal="4dp"
                 android:text="↷"
-                android:textSize="18sp" />
-
+                android:textSize="16sp" />
             <Button
                 android:id="@+id/btnDeletePoint"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="40dp"
                 android:layout_marginEnd="4dp"
                 android:layout_weight="1.3"
                 android:enabled="false"
                 android:minWidth="0dp"
                 android:paddingHorizontal="4dp"
                 android:text="- Точка"
-                android:textSize="12sp" />
-
+                android:textSize="11sp" />
             <Button
                 android:id="@+id/btnDeleteContour"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="40dp"
                 android:layout_weight="1.3"
                 android:enabled="false"
                 android:minWidth="0dp"
                 android:paddingHorizontal="4dp"
                 android:text="Удалить"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
         </LinearLayout>
 
         <LinearLayout
@@ -141,14 +174,12 @@
             android:layout_marginTop="4dp"
             android:gravity="center_vertical"
             android:orientation="horizontal">
-
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Фон: "
                 android:textColor="#CCCCCC"
-                android:textSize="13sp" />
-
+                android:textSize="12sp" />
             <Spinner
                 android:id="@+id/spinnerColor"
                 android:layout_width="0dp"
@@ -162,22 +193,125 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
             android:orientation="horizontal">
-
             <Button
                 android:id="@+id/btnPickVideo"
                 android:layout_width="0dp"
-                android:layout_height="wrap_content"
+                android:layout_height="42dp"
                 android:layout_marginEnd="6dp"
                 android:layout_weight="1"
-                android:text="Видео" />
-
+                android:text="Видео"
+                android:textSize="13sp" />
             <Button
-                android:id="@+id/btnProcess"
+                android:id="@+id/btnProcessRoto"
+                android:layout_width="0dp"
+                android:layout_height="42dp"
+                android:layout_weight="1"
+                android:text="Старт"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Панель режима Перенос качки -->
+    <LinearLayout
+        android:id="@+id/shakeControlsLayout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <Button
+                android:id="@+id/btnPickDonor"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1.2"
+                android:paddingHorizontal="4dp"
+                android:text="Донор (видео)"
+                android:textSize="11sp" />
+            <Button
+                android:id="@+id/btnPickTargetPhoto"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:layout_weight="1"
+                android:paddingHorizontal="4dp"
+                android:text="Цель: Фото"
+                android:textSize="11sp" />
+            <Button
+                android:id="@+id/btnPickTargetVideo"
+                android:layout_width="0dp"
+                android:layout_height="40dp"
+                android:layout_weight="1"
+                android:paddingHorizontal="4dp"
+                android:text="Цель: Видео"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tvShakeInfo"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="4dp"
+            android:text="Донор: не выбран | Цель: не выбрана"
+            android:textColor="#CCCCCC"
+            android:textSize="12sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+            <TextView
+                android:id="@+id/tvShakeStrength"
+                android:layout_width="110dp"
+                android:layout_height="wrap_content"
+                android:text="Сила: 1.0x"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp" />
+            <com.google.android.material.slider.Slider
+                android:id="@+id/sliderStrength"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Старт" />
+                android:stepSize="0.1"
+                android:value="1.0"
+                android:valueFrom="0.0"
+                android:valueTo="2.0" />
         </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+            <TextView
+                android:id="@+id/tvShakeZoom"
+                android:layout_width="110dp"
+                android:layout_height="wrap_content"
+                android:text="Зум краёв: 1.20x"
+                android:textColor="#FFFFFF"
+                android:textSize="12sp" />
+            <com.google.android.material.slider.Slider
+                android:id="@+id/sliderZoom"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:stepSize="0.05"
+                android:value="1.2"
+                android:valueFrom="1.0"
+                android:valueTo="1.5" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnProcessShake"
+            android:layout_width="match_parent"
+            android:layout_height="42dp"
+            android:text="Перенести качку"
+            android:textSize="13sp" />
     </LinearLayout>
 
     <!-- Панель просмотра результата -->
@@ -185,34 +319,31 @@
         android:id="@+id/previewControlsLayout"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="6dp"
         android:orientation="horizontal"
         android:visibility="gone">
-
         <Button
             android:id="@+id/btnBackToEdit"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="42dp"
             android:layout_marginEnd="6dp"
             android:layout_weight="1.2"
             android:paddingHorizontal="4dp"
             android:text="К правке"
             android:textSize="12sp" />
-
         <Button
             android:id="@+id/btnReplay"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="42dp"
             android:layout_marginEnd="6dp"
             android:layout_weight="1"
             android:paddingHorizontal="4dp"
             android:text="Повтор"
             android:textSize="12sp" />
-
         <Button
             android:id="@+id/btnSaveGallery"
             android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            android:layout_height="42dp"
             android:layout_weight="1.2"
             android:paddingHorizontal="4dp"
             android:text="Сохранить"
