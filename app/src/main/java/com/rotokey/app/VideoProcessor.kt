@@ -8,6 +8,8 @@ import android.graphics.PointF
 import android.graphics.Rect
 import android.media.*
 import android.net.Uri
+import android.opengl.EGL14
+import android.opengl.EGLExt
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.Surface
@@ -54,11 +56,7 @@ object VideoProcessor {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, videoUri)
-            val option = if (exact) {
-                MediaMetadataRetriever.OPTION_CLOSEST
-            } else {
-                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-            }
+            val option = if (exact) MediaMetadataRetriever.OPTION_CLOSEST else MediaMetadataRetriever.OPTION_CLOSEST_SYNC
             retriever.getFrameAtTime(timeMs * 1000L, option)
         } catch (_: Exception) {
             null
@@ -81,6 +79,178 @@ object VideoProcessor {
         }
     }
 
+    suspend fun analyzeSegmentHomographies(
+        context: Context,
+        videoUri: Uri,
+        startMs: Long,
+        endMs: Long,
+        onProgress: (current: Int, total: Int) -> Unit
+    ): List<FloatArray> = withContext(Dispatchers.IO) {
+        val info = readVideoInfo(context, videoUri)
+        val range = getSegmentIndices(info.timestampsUs, startMs, endMs)
+        if (range.timestamps.isEmpty()) return@withContext emptyList()
+
+        val result = ArrayList<FloatArray>(range.timestamps.size)
+        val tracker = OpenCVHomographyTracker()
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(context, videoUri)
+
+        try {
+            val total = range.timestamps.size
+            var count = 0
+            val canBatch = info.reportedFrameCount > 0 && info.reportedFrameCount == info.timestampsUs.size
+            if (canBatch) {
+                var idx = range.startIdx
+                while (idx <= range.endIdx) {
+                    val c = min(4, range.endIdx - idx + 1)
+                    val frames = try { retriever.getFramesAtIndex(idx, c) } catch (_: Exception) { emptyList() }
+                    if (frames.isEmpty()) break
+                    for (bmp in frames) {
+                        val h = if (count == 0) tracker.initFirstFrame(bmp) else tracker.stepFrame(bmp)
+                        result.add(h)
+                        bmp.recycle()
+                        count++
+                        onProgress(count, total)
+                    }
+                    idx += frames.size
+                }
+            }
+            if (count == 0) {
+                for (tsUs in range.timestamps) {
+                    val bmp = retriever.getFrameAtTime(tsUs, MediaMetadataRetriever.OPTION_CLOSEST) ?: continue
+                    val h = if (count == 0) tracker.initFirstFrame(bmp) else tracker.stepFrame(bmp)
+                    result.add(h)
+                    bmp.recycle()
+                    count++
+                    onProgress(count, total)
+                }
+            }
+        } finally {
+            tracker.release()
+            retriever.release()
+        }
+        result
+    }
+
+    suspend fun renderEffectsVideo(
+        context: Context,
+        videoUri: Uri,
+        startMs: Long,
+        endMs: Long,
+        effects: List<ShaderEffectLayer>,
+        lockToCamera: Boolean,
+        precomputedHomographies: List<FloatArray>?,
+        onProgress: (phase: String, current: Int, total: Int) -> Unit
+    ): File = withContext(Dispatchers.IO) {
+
+        val videoInfo = readVideoInfo(context, videoUri)
+        val range = getSegmentIndices(videoInfo.timestampsUs, startMs, endMs)
+        if (range.timestamps.isEmpty()) throw IllegalStateException("В выбранном отрезке нет кадров")
+
+        val homographies = if (lockToCamera) {
+            if (!precomputedHomographies.isNullOrEmpty()) {
+                precomputedHomographies
+            } else {
+                analyzeSegmentHomographies(context, videoUri, startMs, endMs) { cur, tot ->
+                    onProgress("3D-трекинг камеры", cur, tot)
+                }
+            }
+        } else {
+            emptyList()
+        }
+
+        val firstBmp = loadFrameAtTime(context, videoUri, startMs, exact = true)
+            ?: throw IllegalStateException("Не удалось прочитать первый кадр")
+        val (outW, outH) = computeEvenSize(firstBmp.width, firstBmp.height)
+        firstBmp.recycle()
+
+        val fps = videoInfo.fps.coerceIn(10, 60)
+        val frameDurationUs = 1_000_000L / fps
+        val audioStartUs = range.timestamps.first()
+        val audioEndUs = range.timestamps.last() + frameDurationUs
+
+        val previewFile = File(context.cacheDir, "rotokey_fx_${System.currentTimeMillis()}.mp4")
+        if (previewFile.exists()) previewFile.delete()
+
+        val eglSession = EglMuxedVideoSession(
+            context = context,
+            outputFile = previewFile,
+            outW = outW,
+            outH = outH,
+            fps = fps,
+            audioSourceUri = videoUri,
+            audioStartUs = audioStartUs,
+            audioEndUs = audioEndUs
+        )
+
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(context, videoUri)
+
+        try {
+            eglSession.makeCurrent()
+            val shaderEngine = ShaderEngine().apply { initGl() }
+            val total = range.timestamps.size
+            var frameCounter = 0
+
+            fun processFrameBitmap(rawBmp: Bitmap) {
+                shaderEngine.uploadBitmap(rawBmp)
+                val invH = if (homographies.isNotEmpty()) {
+                    homographies[frameCounter.coerceIn(0, homographies.lastIndex)]
+                } else {
+                    OpenCVHomographyTracker.identityColMajor()
+                }
+                shaderEngine.renderFromBitmap(
+                    width = rawBmp.width,
+                    height = rawBmp.height,
+                    vpLeft = 0,
+                    vpBottom = 0,
+                    vpWidth = outW,
+                    vpHeight = outH,
+                    effects = effects,
+                    timeSec = frameCounter.toFloat() / fps,
+                    frameIdx = frameCounter.toFloat(),
+                    invHomography = invH
+                )
+                eglSession.swapAndDrain(frameCounter * frameDurationUs)
+                frameCounter++
+                onProgress("Рендер эффектов", frameCounter, total)
+            }
+
+            val canBatch = videoInfo.reportedFrameCount > 0 &&
+                videoInfo.reportedFrameCount == videoInfo.timestampsUs.size
+
+            if (canBatch) {
+                var idx = range.startIdx
+                while (idx <= range.endIdx) {
+                    val count = min(4, range.endIdx - idx + 1)
+                    val frames = try { retriever.getFramesAtIndex(idx, count) } catch (_: Exception) { emptyList() }
+                    if (frames.isEmpty()) break
+                    for (bmp in frames) {
+                        processFrameBitmap(bmp)
+                        bmp.recycle()
+                    }
+                    idx += frames.size
+                }
+            }
+
+            if (frameCounter == 0) {
+                for (tsUs in range.timestamps) {
+                    val bmp = retriever.getFrameAtTime(tsUs, MediaMetadataRetriever.OPTION_CLOSEST) ?: continue
+                    processFrameBitmap(bmp)
+                    bmp.recycle()
+                }
+            }
+
+            shaderEngine.release()
+            eglSession.finish()
+        } finally {
+            retriever.release()
+            eglSession.release()
+        }
+
+        previewFile
+    }
+
     suspend fun processVideoSegment(
         context: Context,
         videoUri: Uri,
@@ -98,8 +268,9 @@ object VideoProcessor {
             throw IllegalStateException("В выбранном отрезке нет кадров")
         }
 
+        val fps = videoInfo.fps.coerceIn(10, 60)
         val audioStartUs = segmentTimestamps.first()
-        val audioEndUs = segmentTimestamps.last() + (1_000_000L / videoInfo.fps.coerceIn(10, 60))
+        val audioEndUs = segmentTimestamps.last() + (1_000_000L / fps)
 
         val firstBmp = loadFrameAtTime(context, videoUri, startMs, exact = true)
             ?: throw IllegalStateException("Не удалось прочитать начальный кадр")
@@ -119,7 +290,7 @@ object VideoProcessor {
             outputFile = previewFile,
             outW = outW,
             outH = outH,
-            fps = videoInfo.fps.coerceIn(10, 60),
+            fps = fps,
             audioSourceUri = videoUri,
             audioStartUs = audioStartUs,
             audioEndUs = audioEndUs
@@ -208,7 +379,6 @@ object VideoProcessor {
             throw IllegalStateException("Выберите фото или видео, на которое перенести качку")
         }
 
-        // Фаза 1: Считываем траекторию камеры с видео-донора
         val donorInfo = readVideoInfo(context, donorVideoUri)
         val donorRange = getSegmentIndices(donorInfo.timestampsUs, donorStartMs, donorEndMs)
         if (donorRange.timestamps.isEmpty()) {
@@ -279,7 +449,6 @@ object VideoProcessor {
         val previewFile = File(context.cacheDir, "rotokey_shake_${System.currentTimeMillis()}.mp4")
         if (previewFile.exists()) previewFile.delete()
 
-        // Фаза 2: Применяем качку на Фото или на Видео
         if (targetPhotoUri != null) {
             val photoBmp = loadPhotoBitmap(context, targetPhotoUri)
             val (outW, outH) = computeEvenSize(photoBmp.width, photoBmp.height)
@@ -453,19 +622,19 @@ object VideoProcessor {
         uri
     }
 
-    private class MuxedVideoSession(
+    private open class BaseMuxedSession(
         context: Context,
         outputFile: File,
-        private val outW: Int,
-        private val outH: Int,
+        outW: Int,
+        outH: Int,
         fps: Int,
         audioSourceUri: Uri?,
         private val audioStartUs: Long,
         private val audioEndUs: Long
     ) {
-        private val frameDurationUs = 1_000_000L / fps
-        private val encoder: MediaCodec
-        private val inputSurface: Surface
+        protected val frameDurationUs = 1_000_000L / fps
+        protected val encoder: MediaCodec
+        protected val inputSurface: Surface
         private val muxer: MediaMuxer
 
         private var videoTrackIndex = -1
@@ -475,7 +644,6 @@ object VideoProcessor {
 
         private var audioExtractor: MediaExtractor? = null
         private var audioFormat: MediaFormat? = null
-        private var sourceAudioTrack = -1
 
         init {
             if (audioSourceUri != null) {
@@ -486,7 +654,6 @@ object VideoProcessor {
                         val fmt = ext.getTrackFormat(i)
                         val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
                         if (mime.startsWith("audio/")) {
-                            sourceAudioTrack = i
                             audioFormat = fmt
                             ext.selectTrack(i)
                             audioExtractor = ext
@@ -514,22 +681,12 @@ object VideoProcessor {
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         }
 
-        fun writeFrame(bmp: Bitmap) {
-            val canvas = inputSurface.lockCanvas(null)
-            try {
-                canvas.drawBitmap(bmp, null, Rect(0, 0, outW, outH), null)
-            } finally {
-                inputSurface.unlockCanvasAndPost(canvas)
-            }
-            drainEncoder(false)
-        }
-
         fun finish() {
             drainEncoder(true)
             copyAudioSamples()
         }
 
-        private fun drainEncoder(endOfStream: Boolean) {
+        protected fun drainEncoder(endOfStream: Boolean) {
             if (endOfStream) encoder.signalEndOfInputStream()
             val bufferInfo = MediaCodec.BufferInfo()
             while (true) {
@@ -607,7 +764,7 @@ object VideoProcessor {
             }
         }
 
-        fun release() {
+        open fun release() {
             try { audioExtractor?.release() } catch (_: Exception) {}
             try { inputSurface.release() } catch (_: Exception) {}
             try { encoder.stop() } catch (_: Exception) {}
@@ -616,6 +773,96 @@ object VideoProcessor {
                 try { muxer.stop() } catch (_: Exception) {}
             }
             try { muxer.release() } catch (_: Exception) {}
+        }
+    }
+
+    private class MuxedVideoSession(
+        context: Context,
+        outputFile: File,
+        private val outW: Int,
+        private val outH: Int,
+        fps: Int,
+        audioSourceUri: Uri?,
+        audioStartUs: Long,
+        audioEndUs: Long
+    ) : BaseMuxedSession(context, outputFile, outW, outH, fps, audioSourceUri, audioStartUs, audioEndUs) {
+        fun writeFrame(bmp: Bitmap) {
+            val canvas = inputSurface.lockCanvas(null)
+            try {
+                canvas.drawBitmap(bmp, null, Rect(0, 0, outW, outH), null)
+            } finally {
+                inputSurface.unlockCanvasAndPost(canvas)
+            }
+            drainEncoder(false)
+        }
+    }
+
+    private class EglMuxedVideoSession(
+        context: Context,
+        outputFile: File,
+        outW: Int,
+        outH: Int,
+        fps: Int,
+        audioSourceUri: Uri?,
+        audioStartUs: Long,
+        audioEndUs: Long
+    ) : BaseMuxedSession(context, outputFile, outW, outH, fps, audioSourceUri, audioStartUs, audioEndUs) {
+
+        private val eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        private val eglContext: android.opengl.EGLContext
+        private val eglSurface: android.opengl.EGLSurface
+
+        init {
+            val ver = IntArray(2)
+            EGL14.eglInitialize(eglDisplay, ver, 0, ver, 1)
+
+            val attribs = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8,
+                EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                0x3142, 1,
+                EGL14.EGL_NONE
+            )
+            val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
+            val numConfigs = IntArray(1)
+            EGL14.eglChooseConfig(eglDisplay, attribs, 0, configs, 0, 1, numConfigs, 0)
+
+            eglContext = EGL14.eglCreateContext(
+                eglDisplay,
+                configs[0],
+                EGL14.EGL_NO_CONTEXT,
+                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE),
+                0
+            )
+            eglSurface = EGL14.eglCreateWindowSurface(
+                eglDisplay,
+                configs[0],
+                inputSurface,
+                intArrayOf(EGL14.EGL_NONE),
+                0
+            )
+        }
+
+        fun makeCurrent() {
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        }
+
+        fun swapAndDrain(ptsUs: Long) {
+            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, ptsUs * 1000L)
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+            drainEncoder(false)
+        }
+
+        override fun release() {
+            try {
+                EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                EGL14.eglDestroySurface(eglDisplay, eglSurface)
+                EGL14.eglDestroyContext(eglDisplay, eglContext)
+                EGL14.eglTerminate(eglDisplay)
+            } catch (_: Exception) {}
+            super.release()
         }
     }
 
